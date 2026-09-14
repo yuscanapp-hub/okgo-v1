@@ -33,6 +33,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body: WhatsAppWebhookPayload = await request.json();
+    console.log('[WhatsApp Webhook POST] Received payload:', JSON.stringify(body, null, 2));
 
     // Validate that payload object and entry array exist
     if (body?.object === 'whatsapp_business_account' && Array.isArray(body?.entry)) {
@@ -53,23 +54,49 @@ export async function POST(request: NextRequest) {
                 messageBody = `[${message.type}]`;
               }
 
-              // Wrap Supabase insert in try/catch so a DB error never causes a non-200 response
+              const recordToInsert = {
+                sender_wa_id: senderWaId,
+                message_body: messageBody,
+                raw_payload: body,
+              };
+
+              const activeSupabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'NOT_SET';
+              console.log(`[Supabase Insert Attempt] Target Table: 'webhook_events'`);
+              console.log(`[Supabase Insert Attempt] Supabase URL: ${activeSupabaseUrl}`);
+              console.log(`[Supabase Insert Attempt] Record to insert:`, JSON.stringify(recordToInsert, null, 2));
+
+              // Perform insert and inspect the { data, error } result object explicitly
               try {
-                await supabase.from('webhook_events').insert({
-                  sender_wa_id: senderWaId,
-                  message_body: messageBody,
-                  raw_payload: body,
-                });
+                const { data, error } = await supabase
+                  .from('webhook_events')
+                  .insert(recordToInsert)
+                  .select();
+
+                if (error) {
+                  console.error('[Supabase Insert Error]:', {
+                    message: error.message,
+                    details: error.details,
+                    hint: error.hint,
+                    code: error.code,
+                    fullError: error,
+                  });
+                } else {
+                  console.log('[Supabase Insert Success] Inserted row:', data);
+                }
               } catch (dbError) {
-                console.error('Error inserting webhook event into Supabase:', dbError);
+                console.error('[Supabase Unexpected Exception]:', dbError);
               }
             }
+          } else {
+            console.log('[WhatsApp Webhook POST] Event ignored: No messages array present (e.g. status/read receipt).');
           }
         }
       }
+    } else {
+      console.log('[WhatsApp Webhook POST] Payload ignored: Not a whatsapp_business_account event.');
     }
   } catch (error) {
-    console.error('Error handling WhatsApp webhook POST payload:', error);
+    console.error('[WhatsApp Webhook POST Exception]:', error);
   }
 
   // Always respond with status 200 immediately to acknowledge receipt to Meta

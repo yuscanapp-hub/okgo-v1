@@ -4,8 +4,15 @@ let supabaseInstance: SupabaseClient | null = null;
 
 export function getSupabaseClient(): SupabaseClient {
   if (!supabaseInstance) {
-    const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
-    const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 'placeholder';
+    const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+    const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+    if (!supabaseUrl || !supabaseServiceRoleKey) {
+      console.warn('[Supabase Initialization Warning] Missing env vars:', {
+        hasSupabaseUrl: Boolean(supabaseUrl),
+        hasServiceRoleKey: Boolean(supabaseServiceRoleKey),
+      });
+    }
 
     supabaseInstance = createClient(supabaseUrl, supabaseServiceRoleKey, {
       auth: {
@@ -20,4 +27,3 @@ export function getSupabaseClient(): SupabaseClient {
 export const supabase = {
   from: (table: string) => getSupabaseClient().from(table),
 };
-
