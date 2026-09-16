@@ -56,7 +56,7 @@ export async function extractOrderFromMessage(messageText: string): Promise<Extr
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: 'openai/gpt-oss-120b',
         response_format: { type: 'json_object' },
         messages: [
           {
@@ -74,11 +74,11 @@ export async function extractOrderFromMessage(messageText: string): Promise<Extr
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(`[Groq API Error] HTTP ${response.status}:`, errorText);
+      console.error(`[Groq API Error] HTTP ${response.status} (${response.statusText}):\nFull Response Body:\n${errorText}`);
       return {
         success: false,
         data: DEFAULT_EXTRACTED_DATA,
-        error: `Groq API responded with HTTP ${response.status}`,
+        error: `Groq API HTTP ${response.status}: ${errorText}`,
       };
     }
 
@@ -86,7 +86,7 @@ export async function extractOrderFromMessage(messageText: string): Promise<Extr
     const content = responseJson?.choices?.[0]?.message?.content;
 
     if (!content) {
-      console.error('[Groq API Error] Empty choices content in response');
+      console.error('[Groq API Error] Empty choices content in response:', JSON.stringify(responseJson, null, 2));
       return {
         success: false,
         data: DEFAULT_EXTRACTED_DATA,
