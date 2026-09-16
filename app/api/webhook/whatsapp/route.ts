@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
+import { extractOrderFromMessage } from '@/lib/groq';
 import { WhatsAppWebhookPayload } from '@/types/whatsapp';
 
 /**
@@ -65,7 +66,7 @@ export async function POST(request: NextRequest) {
               console.log(`[Supabase Insert Attempt] Supabase URL: ${activeSupabaseUrl}`);
               console.log(`[Supabase Insert Attempt] Record to insert:`, JSON.stringify(recordToInsert, null, 2));
 
-              // Perform insert and inspect the { data, error } result object explicitly
+              // 1. Perform insert into webhook_events
               try {
                 const { data, error } = await supabase
                   .from('webhook_events')
@@ -73,7 +74,7 @@ export async function POST(request: NextRequest) {
                   .select();
 
                 if (error) {
-                  console.error('[Supabase Insert Error]:', {
+                  console.error('[Supabase webhook_events Insert Error]:', {
                     message: error.message,
                     details: error.details,
                     hint: error.hint,
@@ -81,10 +82,57 @@ export async function POST(request: NextRequest) {
                     fullError: error,
                   });
                 } else {
-                  console.log('[Supabase Insert Success] Inserted row:', data);
+                  console.log('[Supabase webhook_events Insert Success] Inserted row:', data);
                 }
               } catch (dbError) {
-                console.error('[Supabase Unexpected Exception]:', dbError);
+                console.error('[Supabase webhook_events Unexpected Exception]:', dbError);
+              }
+
+              // 2. Perform Order Extraction via Groq API and insert into 'orders' table
+              if (messageBody && message?.type === 'text') {
+                try {
+                  console.log(`[Order Extraction] Processing message for sender ${senderWaId}...`);
+                  const extractionResult = await extractOrderFromMessage(messageBody);
+
+                  console.log('[Order Extraction Result]:', {
+                    success: extractionResult.success,
+                    extractedData: extractionResult.data,
+                    error: extractionResult.error || null,
+                  });
+
+                  // Prepare orders table row
+                  const orderToInsert = {
+                    seller_wa_id: senderWaId,
+                    buyer_name: extractionResult.data.buyer_name,
+                    buyer_phone: extractionResult.data.buyer_phone,
+                    address: extractionResult.data.address,
+                    product: extractionResult.data.product,
+                    price: extractionResult.data.price,
+                    status: 'pending_confirmation',
+                  };
+
+                  console.log(`[Supabase Insert Attempt] Target Table: 'orders'`);
+                  console.log(`[Supabase Insert Attempt] Order Record to insert:`, JSON.stringify(orderToInsert, null, 2));
+
+                  const { data: orderData, error: orderError } = await supabase
+                    .from('orders')
+                    .insert(orderToInsert)
+                    .select();
+
+                  if (orderError) {
+                    console.error('[Supabase orders Insert Error]:', {
+                      message: orderError.message,
+                      details: orderError.details,
+                      hint: orderError.hint,
+                      code: orderError.code,
+                      fullError: orderError,
+                    });
+                  } else {
+                    console.log('[Supabase orders Insert Success] Inserted order row:', orderData);
+                  }
+                } catch (orderProcessErr) {
+                  console.error('[Order Processing Exception]:', orderProcessErr);
+                }
               }
             }
           } else {
