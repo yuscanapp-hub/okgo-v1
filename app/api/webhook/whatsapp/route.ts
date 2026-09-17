@@ -103,9 +103,113 @@ export async function POST(request: NextRequest) {
                 console.error('[Supabase webhook_events Unexpected Exception]:', dbError);
               }
 
-              // 2. Handle Text Messages: Order Extraction & Risk-Based Messaging
+              // 2a. Handle Location Messages: Resolve address from GPS pin
+              if (message?.type === 'location' && message?.location) {
+                const { latitude, longitude } = message.location;
+                const mapsUrl = `https://maps.google.com/?q=${latitude},${longitude}`;
+                console.log(`[Location Received] Sender: ${recipientPhone}, Maps URL: ${mapsUrl}`);
+
+                try {
+                  // Find active pending order for this buyer
+                  const { data: existingOrder, error: findErr } = await supabase
+                    .from('orders')
+                    .select('*')
+                    .eq('buyer_wa_id', recipientPhone)
+                    .eq('status', 'PENDING_CONFIRMATION')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .single();
+
+                  if (findErr || !existingOrder) {
+                    console.warn('[Location Received] No pending order found for sender:', recipientPhone, findErr);
+                    await sendTextMessage(
+                      recipientPhone,
+                      '⚠️ We received your location pin, but couldn\'t find an active pending order. Please place an order first.'
+                    );
+                  } else {
+                    // Update address with Google Maps URL
+                    const { error: addrErr } = await supabase
+                      .from('orders')
+                      .update({
+                        address: mapsUrl,
+                        address_is_complete: true,
+                        risk_tier: 'LOW',
+                        updated_at: new Date().toISOString(),
+                      })
+                      .eq('id', existingOrder.id);
+
+                    if (addrErr) {
+                      console.error('[Location Address Update Error]:', addrErr);
+                    } else {
+                      console.log('[Location Address Update Success] Order ID:', existingOrder.id, 'Address:', mapsUrl);
+                    }
+
+                    // Re-send interactive confirmation buttons
+                    const productDisplay = existingOrder.product || 'N/A';
+                    const priceDisplay = existingOrder.price || 'N/A';
+                    const buttonText = `📍 Location received! Order details:\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${mapsUrl}\n\nPlease confirm your order below:`;
+
+                    await sendInteractiveButtons(recipientPhone, buttonText, [
+                      { id: `CONFIRM_${existingOrder.id}`, title: '✅ Confirm Order' },
+                      { id: `OPTIONS_${existingOrder.id}`, title: '⚙️ Order Options' },
+                    ]);
+                  }
+                } catch (locErr) {
+                  console.error('[Location Processing Exception]:', locErr);
+                }
+              }
+
+              // 2b. Handle Text Messages: Order Extraction & Risk-Based Messaging
               if (message?.type === 'text' && messageBody) {
                 try {
+                  // Check if this text is a follow-up address for an existing PENDING_CONFIRMATION order
+                  const { data: pendingOrder, error: pendingErr } = await supabase
+                    .from('orders')
+                    .select('*')
+                    .eq('buyer_wa_id', recipientPhone)
+                    .eq('status', 'PENDING_CONFIRMATION')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .single();
+
+                  if (!pendingErr && pendingOrder) {
+                    console.log(`[Follow-up Address] Found pending order ${pendingOrder.id} for ${recipientPhone}. Updating address with text reply.`);
+
+                    // Append the text to existing address (or replace 'Pending')
+                    const currentAddress = pendingOrder.address && pendingOrder.address !== 'Pending'
+                      ? `${pendingOrder.address} - ${messageBody}`
+                      : messageBody;
+
+                    const { error: addrTextErr } = await supabase
+                      .from('orders')
+                      .update({
+                        address: currentAddress,
+                        address_is_complete: true,
+                        risk_tier: 'LOW',
+                        updated_at: new Date().toISOString(),
+                      })
+                      .eq('id', pendingOrder.id);
+
+                    if (addrTextErr) {
+                      console.error('[Follow-up Address Update Error]:', addrTextErr);
+                    } else {
+                      console.log('[Follow-up Address Update Success] Order ID:', pendingOrder.id, 'Address:', currentAddress);
+                    }
+
+                    // Re-send interactive confirmation buttons
+                    const productDisplay = pendingOrder.product || 'N/A';
+                    const priceDisplay = pendingOrder.price || 'N/A';
+                    const addrButtonText = `📍 Address updated!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${currentAddress}\n\nPlease confirm your order below:`;
+
+                    await sendInteractiveButtons(recipientPhone, addrButtonText, [
+                      { id: `CONFIRM_${pendingOrder.id}`, title: '✅ Confirm Order' },
+                      { id: `OPTIONS_${pendingOrder.id}`, title: '⚙️ Order Options' },
+                    ]);
+
+                    // Skip Groq extraction — this was an address reply, not a new order
+                    continue;
+                  }
+
                   console.log(`[Order Extraction] Processing message for sender ${recipientPhone}...`);
                   const extractionResult = await extractOrderFromMessage(messageBody);
                   const extracted = extractionResult.data;
