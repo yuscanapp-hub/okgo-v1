@@ -10,15 +10,55 @@ export interface WhatsAppSendResult {
 }
 
 /**
+ * Resolves the WhatsApp API bearer token from the environment.
+ * Checks WHATSAPP_ACCESS_TOKEN first, then falls back to WHATSAPP_TOKEN.
+ * Throws a hard error if neither is present so we never send "Bearer undefined".
+ */
+function resolveToken(): string {
+  const token =
+    process.env.WHATSAPP_ACCESS_TOKEN || process.env.WHATSAPP_TOKEN;
+
+  if (!token) {
+    console.error(
+      '[WhatsApp API Error] Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_TOKEN in environment'
+    );
+    throw new Error(
+      'WhatsApp API token is not configured. Set WHATSAPP_ACCESS_TOKEN or WHATSAPP_TOKEN.'
+    );
+  }
+
+  // Log a masked version so we can confirm which token instance is loaded in Vercel logs.
+  const masked =
+    token.length > 8
+      ? `${token.slice(0, 4)}${'*'.repeat(token.length - 8)}${token.slice(-4)}`
+      : '****';
+  console.log(`[WhatsApp API] Resolved token: ${masked}`);
+
+  return token;
+}
+
+/**
  * Sends a plain text message via Meta WhatsApp Cloud API.
  */
-export async function sendTextMessage(to: string, text: string): Promise<WhatsAppSendResult> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+export async function sendTextMessage(
+  to: string,
+  text: string
+): Promise<WhatsAppSendResult> {
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-  if (!token || !phoneNumberId) {
-    console.warn('[WhatsApp API Warning] Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID in env.');
-    return { success: false, error: 'WhatsApp credentials missing' };
+  if (!phoneNumberId) {
+    console.error(
+      '[WhatsApp API Error] Missing WHATSAPP_PHONE_NUMBER_ID in environment'
+    );
+    return { success: false, error: 'WHATSAPP_PHONE_NUMBER_ID is not configured' };
+  }
+
+  let token: string;
+  try {
+    token = resolveToken();
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    return { success: false, error: errorMessage };
   }
 
   const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
@@ -26,12 +66,13 @@ export async function sendTextMessage(to: string, text: string): Promise<WhatsAp
   const payload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: to,
+    to,
     type: 'text',
     text: { body: text },
   };
 
   try {
+    console.log(`[WhatsApp API] Sending text message to ${to}`);
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -48,7 +89,7 @@ export async function sendTextMessage(to: string, text: string): Promise<WhatsAp
       return { success: false, data: responseData, error: `HTTP ${response.status}` };
     }
 
-    console.log('[WhatsApp API Success] Message sent:', responseData);
+    console.log('[WhatsApp API Success] Text message sent:', responseData);
     return { success: true, data: responseData };
   } catch (err: unknown) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -66,12 +107,21 @@ export async function sendInteractiveButtons(
   bodyText: string,
   buttons: WhatsAppButton[]
 ): Promise<WhatsAppSendResult> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-  if (!token || !phoneNumberId) {
-    console.warn('[WhatsApp API Warning] Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID in env.');
-    return { success: false, error: 'WhatsApp credentials missing' };
+  if (!phoneNumberId) {
+    console.error(
+      '[WhatsApp API Error] Missing WHATSAPP_PHONE_NUMBER_ID in environment'
+    );
+    return { success: false, error: 'WHATSAPP_PHONE_NUMBER_ID is not configured' };
+  }
+
+  let token: string;
+  try {
+    token = resolveToken();
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    return { success: false, error: errorMessage };
   }
 
   const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
@@ -88,7 +138,7 @@ export async function sendInteractiveButtons(
   const payload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to: to,
+    to,
     type: 'interactive',
     interactive: {
       type: 'button',
@@ -100,6 +150,7 @@ export async function sendInteractiveButtons(
   };
 
   try {
+    console.log(`[WhatsApp API] Sending interactive buttons to ${to}`);
     const response = await fetch(url, {
       method: 'POST',
       headers: {
