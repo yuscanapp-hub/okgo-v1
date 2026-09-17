@@ -159,93 +159,11 @@ export async function POST(request: NextRequest) {
                 }
               }
 
-              // 2b. Handle Text Messages: Order Extraction & Risk-Based Messaging
+              // 2b. Handle Text Messages — Intent-first extraction then route
               if (message?.type === 'text' && messageBody) {
                 try {
-                  // Check if this text is a follow-up address for an existing PENDING_CONFIRMATION order
-                  const { data: pendingOrder, error: pendingErr } = await supabase
-                    .from('orders')
-                    .select('*')
-                    .eq('buyer_wa_id', recipientPhone)
-                    .eq('status', 'PENDING_CONFIRMATION')
-                    .order('created_at', { ascending: false })
-                    .limit(1)
-                    .single();
-
-                  if (!pendingErr && pendingOrder) {
-                    console.log(`[Follow-up Address] Found pending order ${pendingOrder.id} for ${recipientPhone}. Running Groq extraction on follow-up text.`);
-
-                    // Run Groq to extract a clean address entity (and any missing fields)
-                    let cleanAddress: string = pendingOrder.address || 'Pending';
-                    let followUpProduct: string | null = null;
-                    let followUpPrice: string | null = null;
-
-                    try {
-                      const followUpResult = await extractOrderFromMessage(messageBody);
-                      const followUpData = followUpResult.data;
-
-                      console.log('[Follow-up Groq Extraction]:', followUpData);
-
-                      if (followUpData.address && followUpData.address !== 'Pending') {
-                        // Use the LLM-extracted address entity
-                        cleanAddress = followUpData.address;
-                      } else if (messageBody.length <= 50) {
-                        // Fallback: raw text is short enough to be a valid address
-                        cleanAddress = messageBody;
-                      }
-                      // else: preserve existing address — raw text too long / unstructured
-
-                      // Patch missing product/price if LLM found them in this follow-up
-                      if (followUpData.product && (!pendingOrder.product || pendingOrder.product === 'N/A')) {
-                        followUpProduct = followUpData.product;
-                      }
-                      if (followUpData.price && (!pendingOrder.price || pendingOrder.price === 'N/A')) {
-                        followUpPrice = followUpData.price;
-                      }
-                    } catch (followUpGroqErr) {
-                      console.error('[Follow-up Groq Exception]:', followUpGroqErr);
-                      // Fallback: use raw text only if short enough
-                      if (messageBody.length <= 50) {
-                        cleanAddress = messageBody;
-                      }
-                    }
-
-                    // Build update payload
-                    const addrUpdatePayload: Record<string, unknown> = {
-                      address: cleanAddress,
-                      address_is_complete: true,
-                      risk_tier: 'LOW',
-                      updated_at: new Date().toISOString(),
-                    };
-                    if (followUpProduct) addrUpdatePayload.product = followUpProduct;
-                    if (followUpPrice) addrUpdatePayload.price = followUpPrice;
-
-                    const { error: addrTextErr } = await supabase
-                      .from('orders')
-                      .update(addrUpdatePayload)
-                      .eq('id', pendingOrder.id);
-
-                    if (addrTextErr) {
-                      console.error('[Follow-up Address Update Error]:', addrTextErr);
-                    } else {
-                      console.log('[Follow-up Address Update Success] Order ID:', pendingOrder.id, 'Address:', cleanAddress);
-                    }
-
-                    // Re-send interactive confirmation buttons with clean values
-                    const productDisplay = followUpProduct || pendingOrder.product || 'N/A';
-                    const priceDisplay = followUpPrice || pendingOrder.price || 'N/A';
-                    const addrButtonText = `📍 Address updated!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${cleanAddress}\n\nPlease confirm your order below:`;
-
-                    await sendInteractiveButtons(recipientPhone, addrButtonText, [
-                      { id: `CONFIRM_${pendingOrder.id}`, title: '✅ Confirm Order' },
-                      { id: `OPTIONS_${pendingOrder.id}`, title: '⚙️ Order Options' },
-                    ]);
-
-                    // Skip Groq new-order extraction — this was an address/detail reply
-                    continue;
-                  }
-
-                  console.log(`[Order Extraction] Processing message for sender ${recipientPhone}...`);
+                  // STEP 1: Always run Groq extraction first to determine intent
+                  console.log(`[Order Extraction] Running Groq extraction for sender ${recipientPhone}...`);
                   const extractionResult = await extractOrderFromMessage(messageBody);
                   const extracted = extractionResult.data;
 
@@ -255,71 +173,159 @@ export async function POST(request: NextRequest) {
                     error: extractionResult.error || null,
                   });
 
-                  // Prepare order payload matching ground-truth Supabase orders schema
-                  const orderToInsert = {
-                    seller_wa_id: recipientPhone,
-                    buyer_wa_id: recipientPhone,
-                    buyer_name: extracted.buyer_name || 'Unknown',
-                    buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : recipientPhone,
-                    address: extracted.address || 'Pending',
-                    product: extracted.product || 'N/A',
-                    price: extracted.price || 'N/A',
-                    status: 'PENDING_CONFIRMATION',
-                    extracted_data: extracted,
-                    address_is_complete: Boolean(extracted.address_is_complete),
-                    risk_tier: extracted.risk_tier || 'LOW',
-                    updated_at: new Date().toISOString(),
-                  };
+                  const hasProduct = extracted.product && extracted.product !== 'N/A';
+                  const hasPrice = extracted.price && extracted.price !== 'N/A';
+                  const isNewOrderIntent = hasProduct || hasPrice;
 
-                  let insertedOrderId = `temp_${Date.now()}`;
-                  console.log(`[Supabase Insert Attempt] Target Table: 'orders'`);
+                  // STEP 2: Check for an existing PENDING_CONFIRMATION order for this buyer
+                  const { data: pendingOrder, error: pendingErr } = await supabase
+                    .from('orders')
+                    .select('*')
+                    .eq('buyer_wa_id', recipientPhone)
+                    .eq('status', 'PENDING_CONFIRMATION')
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .single();
 
-                  try {
-                    const { data: orderData, error: orderError } = await supabase
-                      .from('orders')
-                      .insert(orderToInsert)
-                      .select();
+                  const hasPendingOrder = !pendingErr && pendingOrder;
 
-                    if (orderError) {
-                      console.error('[Supabase orders Insert Error]:', {
-                        message: orderError.message,
-                        details: orderError.details,
-                        hint: orderError.hint,
-                        code: orderError.code,
-                      });
-                    } else {
-                      console.log('[Supabase orders Insert Success] Inserted order row:', orderData);
-                      if (orderData?.[0]?.id) {
-                        insertedOrderId = String(orderData[0].id);
+                  // ── PATH A: New order intent (product or price detected) ──────────────
+                  if (isNewOrderIntent) {
+                    console.log(`[Intent: NEW ORDER] product="${extracted.product}" price="${extracted.price}" for ${recipientPhone}`);
+
+                    // Supersede any existing pending order
+                    if (hasPendingOrder) {
+                      console.log(`[Supersede] Cancelling existing pending order ${pendingOrder.id} as SUPERSEDED_BY_NEW_ORDER`);
+                      try {
+                        const { error: supersedErr } = await supabase
+                          .from('orders')
+                          .update({
+                            status: 'CANCELLED_PRE_DISPATCH',
+                            cancelled_at: new Date().toISOString(),
+                            cancellation_reason: 'SUPERSEDED_BY_NEW_ORDER',
+                            updated_at: new Date().toISOString(),
+                          })
+                          .eq('id', pendingOrder.id);
+
+                        if (supersedErr) {
+                          console.error('[Supersede Error]:', supersedErr);
+                        } else {
+                          console.log('[Supersede Success] Old order marked CANCELLED_PRE_DISPATCH:', pendingOrder.id);
+                        }
+                      } catch (supersedEx) {
+                        console.error('[Supersede Exception]:', supersedEx);
                       }
                     }
-                  } catch (ordersDbErr) {
-                    console.error('[Supabase orders Insert Exception]:', ordersDbErr);
-                  }
 
-                  // ALWAYS route outbound WhatsApp Cloud API messages to recipientPhone (sender's WA ID)
-                  if (extracted.risk_tier === 'LOW') {
-                    console.log(`[Risk Routing] LOW Risk order. Sending interactive confirmation buttons to ${recipientPhone}...`);
-                    const productDisplay = extracted.product || 'N/A';
-                    const priceDisplay = extracted.price || 'N/A';
-                    const addressDisplay = extracted.address || 'Pending';
+                    // Insert fresh order row
+                    const orderToInsert = {
+                      seller_wa_id: recipientPhone,
+                      buyer_wa_id: recipientPhone,
+                      buyer_name: extracted.buyer_name || 'Unknown',
+                      buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : recipientPhone,
+                      address: extracted.address || 'Pending',
+                      product: extracted.product || 'N/A',
+                      price: extracted.price || 'N/A',
+                      status: 'PENDING_CONFIRMATION',
+                      extracted_data: extracted,
+                      address_is_complete: Boolean(extracted.address_is_complete),
+                      risk_tier: extracted.risk_tier || 'LOW',
+                      updated_at: new Date().toISOString(),
+                    };
 
-                    const buttonText = `✅ Order Received!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${addressDisplay}\n\nPlease confirm your order details below:`;
+                    let insertedOrderId = `temp_${Date.now()}`;
+                    console.log(`[Supabase Insert Attempt] Target Table: 'orders'`);
 
-                    await sendInteractiveButtons(recipientPhone, buttonText, [
-                      { id: `CONFIRM_${insertedOrderId}`, title: '✅ Confirm Order' },
-                      { id: `OPTIONS_${insertedOrderId}`, title: '⚙️ Order Options' },
+                    try {
+                      const { data: orderData, error: orderError } = await supabase
+                        .from('orders')
+                        .insert(orderToInsert)
+                        .select();
+
+                      if (orderError) {
+                        console.error('[Supabase orders Insert Error]:', {
+                          message: orderError.message,
+                          details: orderError.details,
+                          hint: orderError.hint,
+                          code: orderError.code,
+                        });
+                      } else {
+                        console.log('[Supabase orders Insert Success]:', orderData);
+                        if (orderData?.[0]?.id) {
+                          insertedOrderId = String(orderData[0].id);
+                        }
+                      }
+                    } catch (ordersDbErr) {
+                      console.error('[Supabase orders Insert Exception]:', ordersDbErr);
+                    }
+
+                    // Send buyer response based on risk tier
+                    if (extracted.risk_tier === 'LOW') {
+                      console.log(`[Risk Routing] LOW — sending confirmation buttons to ${recipientPhone}`);
+                      const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'Pending'}\n\nPlease confirm your order details below:`;
+                      await sendInteractiveButtons(recipientPhone, buttonText, [
+                        { id: `CONFIRM_${insertedOrderId}`, title: '✅ Confirm Order' },
+                        { id: `OPTIONS_${insertedOrderId}`, title: '⚙️ Order Options' },
+                      ]);
+                    } else {
+                      console.log(`[Risk Routing] ${extracted.risk_tier} — requesting address from ${recipientPhone}`);
+                      await sendTextMessage(
+                        recipientPhone,
+                        '📍 To complete your order confirmation, please share your WhatsApp Location Pin or reply with your full delivery address (City & Street).'
+                      );
+                    }
+
+                  // ── PATH B: No new product/price — treat as address follow-up ────────
+                  } else if (hasPendingOrder) {
+                    console.log(`[Intent: ADDRESS UPDATE] No product/price in message. Updating address for order ${pendingOrder.id}`);
+
+                    // Prefer Groq-extracted address; fallback to raw text if ≤ 50 chars
+                    let cleanAddress: string = pendingOrder.address || 'Pending';
+                    if (extracted.address && extracted.address !== 'Pending') {
+                      cleanAddress = extracted.address;
+                    } else if (messageBody.length <= 50) {
+                      cleanAddress = messageBody;
+                    }
+
+                    console.log('[Address Update] Resolved cleanAddress:', cleanAddress);
+
+                    const { error: addrTextErr } = await supabase
+                      .from('orders')
+                      .update({
+                        address: cleanAddress,
+                        address_is_complete: true,
+                        risk_tier: 'LOW',
+                        updated_at: new Date().toISOString(),
+                      })
+                      .eq('id', pendingOrder.id);
+
+                    if (addrTextErr) {
+                      console.error('[Address Update Error]:', addrTextErr);
+                    } else {
+                      console.log('[Address Update Success] Order ID:', pendingOrder.id, 'Address:', cleanAddress);
+                    }
+
+                    const productDisplay = pendingOrder.product || 'N/A';
+                    const priceDisplay = pendingOrder.price || 'N/A';
+                    const addrButtonText = `📍 Address updated!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${cleanAddress}\n\nPlease confirm your order below:`;
+
+                    await sendInteractiveButtons(recipientPhone, addrButtonText, [
+                      { id: `CONFIRM_${pendingOrder.id}`, title: '✅ Confirm Order' },
+                      { id: `OPTIONS_${pendingOrder.id}`, title: '⚙️ Order Options' },
                     ]);
-                  } else {
-                    console.log(`[Risk Routing] ${extracted.risk_tier} Risk order. Requesting location pin / full address from ${recipientPhone}...`);
-                    const requestText = `📍 To complete your order confirmation, please share your current WhatsApp Location Pin or reply with your full delivery address (City & Street).`;
 
-                    await sendTextMessage(recipientPhone, requestText);
+                  // ── PATH C: No intent, no pending order — ignore or prompt ──────────
+                  } else {
+                    console.log(`[Intent: UNKNOWN] No product/price extracted and no pending order found for ${recipientPhone}. Ignoring message.`);
                   }
+
                 } catch (orderProcessErr) {
                   console.error('[Order Processing Exception]:', orderProcessErr);
                 }
               }
+
+
+
 
               // 3. Handle Interactive Button Payloads with Strict Protocol Guardrails & State Locking
               if (message?.type === 'interactive') {
