@@ -173,40 +173,75 @@ export async function POST(request: NextRequest) {
                     .single();
 
                   if (!pendingErr && pendingOrder) {
-                    console.log(`[Follow-up Address] Found pending order ${pendingOrder.id} for ${recipientPhone}. Updating address with text reply.`);
+                    console.log(`[Follow-up Address] Found pending order ${pendingOrder.id} for ${recipientPhone}. Running Groq extraction on follow-up text.`);
 
-                    // Append the text to existing address (or replace 'Pending')
-                    const currentAddress = pendingOrder.address && pendingOrder.address !== 'Pending'
-                      ? `${pendingOrder.address} - ${messageBody}`
-                      : messageBody;
+                    // Run Groq to extract a clean address entity (and any missing fields)
+                    let cleanAddress: string = pendingOrder.address || 'Pending';
+                    let followUpProduct: string | null = null;
+                    let followUpPrice: string | null = null;
+
+                    try {
+                      const followUpResult = await extractOrderFromMessage(messageBody);
+                      const followUpData = followUpResult.data;
+
+                      console.log('[Follow-up Groq Extraction]:', followUpData);
+
+                      if (followUpData.address && followUpData.address !== 'Pending') {
+                        // Use the LLM-extracted address entity
+                        cleanAddress = followUpData.address;
+                      } else if (messageBody.length <= 50) {
+                        // Fallback: raw text is short enough to be a valid address
+                        cleanAddress = messageBody;
+                      }
+                      // else: preserve existing address — raw text too long / unstructured
+
+                      // Patch missing product/price if LLM found them in this follow-up
+                      if (followUpData.product && (!pendingOrder.product || pendingOrder.product === 'N/A')) {
+                        followUpProduct = followUpData.product;
+                      }
+                      if (followUpData.price && (!pendingOrder.price || pendingOrder.price === 'N/A')) {
+                        followUpPrice = followUpData.price;
+                      }
+                    } catch (followUpGroqErr) {
+                      console.error('[Follow-up Groq Exception]:', followUpGroqErr);
+                      // Fallback: use raw text only if short enough
+                      if (messageBody.length <= 50) {
+                        cleanAddress = messageBody;
+                      }
+                    }
+
+                    // Build update payload
+                    const addrUpdatePayload: Record<string, unknown> = {
+                      address: cleanAddress,
+                      address_is_complete: true,
+                      risk_tier: 'LOW',
+                      updated_at: new Date().toISOString(),
+                    };
+                    if (followUpProduct) addrUpdatePayload.product = followUpProduct;
+                    if (followUpPrice) addrUpdatePayload.price = followUpPrice;
 
                     const { error: addrTextErr } = await supabase
                       .from('orders')
-                      .update({
-                        address: currentAddress,
-                        address_is_complete: true,
-                        risk_tier: 'LOW',
-                        updated_at: new Date().toISOString(),
-                      })
+                      .update(addrUpdatePayload)
                       .eq('id', pendingOrder.id);
 
                     if (addrTextErr) {
                       console.error('[Follow-up Address Update Error]:', addrTextErr);
                     } else {
-                      console.log('[Follow-up Address Update Success] Order ID:', pendingOrder.id, 'Address:', currentAddress);
+                      console.log('[Follow-up Address Update Success] Order ID:', pendingOrder.id, 'Address:', cleanAddress);
                     }
 
-                    // Re-send interactive confirmation buttons
-                    const productDisplay = pendingOrder.product || 'N/A';
-                    const priceDisplay = pendingOrder.price || 'N/A';
-                    const addrButtonText = `📍 Address updated!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${currentAddress}\n\nPlease confirm your order below:`;
+                    // Re-send interactive confirmation buttons with clean values
+                    const productDisplay = followUpProduct || pendingOrder.product || 'N/A';
+                    const priceDisplay = followUpPrice || pendingOrder.price || 'N/A';
+                    const addrButtonText = `📍 Address updated!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${cleanAddress}\n\nPlease confirm your order below:`;
 
                     await sendInteractiveButtons(recipientPhone, addrButtonText, [
                       { id: `CONFIRM_${pendingOrder.id}`, title: '✅ Confirm Order' },
                       { id: `OPTIONS_${pendingOrder.id}`, title: '⚙️ Order Options' },
                     ]);
 
-                    // Skip Groq extraction — this was an address reply, not a new order
+                    // Skip Groq new-order extraction — this was an address/detail reply
                     continue;
                   }
 
