@@ -116,15 +116,20 @@ export async function POST(request: NextRequest) {
                     error: extractionResult.error || null,
                   });
 
-                  // Prepare order payload matching standard Supabase orders schema, defaulting null product & price to 'N/A'
+                  // Prepare order payload matching ground-truth Supabase orders schema
                   const orderToInsert = {
                     seller_wa_id: recipientPhone,
-                    buyer_name: extracted.buyer_name || null,
-                    buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : null,
-                    address: extracted.address || null,
+                    buyer_wa_id: recipientPhone,
+                    buyer_name: extracted.buyer_name || 'Unknown',
+                    buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : recipientPhone,
+                    address: extracted.address || 'Pending',
                     product: extracted.product || 'N/A',
                     price: extracted.price || 'N/A',
                     status: 'PENDING_CONFIRMATION',
+                    extracted_data: extracted,
+                    address_is_complete: Boolean(extracted.address_is_complete),
+                    risk_tier: extracted.risk_tier || 'LOW',
+                    updated_at: new Date().toISOString(),
                   };
 
                   let insertedOrderId = `temp_${Date.now()}`;
@@ -158,7 +163,7 @@ export async function POST(request: NextRequest) {
                     console.log(`[Risk Routing] LOW Risk order. Sending interactive confirmation buttons to ${recipientPhone}...`);
                     const productDisplay = extracted.product || 'N/A';
                     const priceDisplay = extracted.price || 'N/A';
-                    const addressDisplay = extracted.address || 'N/A';
+                    const addressDisplay = extracted.address || 'Pending';
 
                     const buttonText = `✅ Order Received!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${addressDisplay}\n\nPlease confirm your order details below:`;
 
@@ -217,6 +222,7 @@ export async function POST(request: NextRequest) {
                             status: 'CONFIRMED',
                             confirmed_at: new Date().toISOString(),
                             confirmation_window_expires_at: expiresAt,
+                            updated_at: new Date().toISOString(),
                           })
                           .eq('id', targetOrderId)
                           .select();
@@ -279,6 +285,7 @@ export async function POST(request: NextRequest) {
                             status: 'CANCELLED_PRE_DISPATCH',
                             cancelled_at: new Date().toISOString(),
                             cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
+                            updated_at: new Date().toISOString(),
                           })
                           .eq('id', targetOrderId)
                           .select();
