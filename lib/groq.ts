@@ -4,6 +4,8 @@ export interface ExtractedOrder {
   address: string | null;
   product: string | null;
   price: string | null;
+  address_is_complete: boolean;
+  risk_tier: 'LOW' | 'MEDIUM' | 'HIGH';
 }
 
 export interface ExtractedOrderResult {
@@ -19,11 +21,13 @@ const DEFAULT_EXTRACTED_DATA: ExtractedOrder = {
   address: null,
   product: null,
   price: null,
+  address_is_complete: false,
+  risk_tier: 'MEDIUM',
 };
 
 /**
- * Extracts structured order data from a seller's WhatsApp message using Groq API.
- * Supports Tunisian Arabic dialect, French, and Arabizi (Latin-script Arabic).
+ * Extracts structured order data and evaluates address completeness & risk tier
+ * from a seller's WhatsApp message using Groq API (openai/gpt-oss-120b).
  */
 export async function extractOrderFromMessage(messageText: string): Promise<ExtractedOrderResult> {
   const apiKey = process.env.GROQ_API_KEY;
@@ -46,7 +50,7 @@ export async function extractOrderFromMessage(messageText: string): Promise<Extr
   }
 
   const systemPrompt =
-    'You are an order extraction assistant for a Tunisian e-commerce platform. Sellers send messages in a mix of Tunisian Arabic dialect, French, and Arabizi (Latin-script Arabic). Extract the following fields from the message and return ONLY valid JSON, no other text: buyer_name (string or null), buyer_phone (string or null), address (string or null), product (string or null), price (string or null). If a field isn\'t present in the message, use null.';
+    'You are an order extraction assistant for a Tunisian e-commerce platform. Sellers send messages in a mix of Tunisian Arabic dialect, French, and Arabizi (Latin-script Arabic). Extract the following fields from the message and return ONLY valid JSON, no other text: buyer_name (string or null), buyer_phone (string or null), address (string or null), product (string or null), price (string or null), address_is_complete (boolean: set true if address specifies city/delegation/neighborhood or street, false if vague or missing), risk_tier ("LOW", "MEDIUM", or "HIGH": set LOW if address_is_complete is true and buyer_phone or name is present; set MEDIUM if address_is_complete is false or vague; set HIGH if crucial order info is missing). If a string field isn\'t present in the message, use null.';
 
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -98,12 +102,22 @@ export async function extractOrderFromMessage(messageText: string): Promise<Extr
     try {
       const parsedData = JSON.parse(content);
 
+      const addressIsComplete = Boolean(parsedData.address_is_complete);
+      let riskTier: 'LOW' | 'MEDIUM' | 'HIGH' = 'MEDIUM';
+      if (['LOW', 'MEDIUM', 'HIGH'].includes(parsedData.risk_tier)) {
+        riskTier = parsedData.risk_tier;
+      } else if (addressIsComplete) {
+        riskTier = 'LOW';
+      }
+
       const extracted: ExtractedOrder = {
         buyer_name: typeof parsedData.buyer_name === 'string' ? parsedData.buyer_name : null,
         buyer_phone: typeof parsedData.buyer_phone === 'string' ? parsedData.buyer_phone : null,
         address: typeof parsedData.address === 'string' ? parsedData.address : null,
         product: typeof parsedData.product === 'string' ? parsedData.product : null,
         price: typeof parsedData.price === 'string' ? parsedData.price : null,
+        address_is_complete: addressIsComplete,
+        risk_tier: riskTier,
       };
 
       return {

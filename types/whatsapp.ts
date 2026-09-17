@@ -11,12 +11,25 @@ export interface WhatsAppTextMessage {
   body?: string;
 }
 
+export interface WhatsAppButtonReply {
+  id: string;
+  title: string;
+}
+
+export interface WhatsAppInteractiveReply {
+  type: string;
+  button_reply?: WhatsAppButtonReply;
+  list_reply?: { id: string; title: string; description?: string };
+}
+
 export interface WhatsAppMessage {
   from: string;
   id: string;
   timestamp: string;
-  type: string;
+  type: string; // 'text' | 'interactive' | 'location' | etc.
   text?: WhatsAppTextMessage;
+  interactive?: WhatsAppInteractiveReply;
+  location?: { latitude: number; longitude: number; name?: string; address?: string };
   [key: string]: unknown;
 }
 
