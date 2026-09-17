@@ -100,7 +100,7 @@ export async function POST(request: NextRequest) {
                     error: extractionResult.error || null,
                   });
 
-                  // Prepare order payload
+                  // Prepare order payload matching Supabase orders schema
                   const orderToInsert = {
                     seller_wa_id: senderWaId,
                     buyer_name: extracted.buyer_name,
@@ -108,9 +108,11 @@ export async function POST(request: NextRequest) {
                     address: extracted.address,
                     product: extracted.product,
                     price: extracted.price,
-                    address_is_complete: extracted.address_is_complete,
-                    risk_tier: extracted.risk_tier,
                     status: 'PENDING_CONFIRMATION',
+                    extracted_data: {
+                      address_is_complete: extracted.address_is_complete,
+                      risk_tier: extracted.risk_tier,
+                    },
                   };
 
                   console.log(`[Supabase Insert Attempt] Target Table: 'orders'`);
