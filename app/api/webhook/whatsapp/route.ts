@@ -5,6 +5,18 @@ import { sendInteractiveButtons, sendTextMessage } from '@/lib/whatsapp';
 import { WhatsAppWebhookPayload } from '@/types/whatsapp';
 
 /**
+ * Formats a raw phone number / WhatsApp ID into a clean digit string suitable for Meta Cloud API.
+ * Prefixes Tunisia country code '216' if given an 8-digit local number (e.g. '26342535' -> '21626342535').
+ */
+function formatWhatsAppId(rawPhone: string): string {
+  const digits = rawPhone.replace(/\D/g, '');
+  if (digits.length === 8) {
+    return `216${digits}`;
+  }
+  return digits;
+}
+
+/**
  * GET /api/webhook/whatsapp
  * Meta calls this to verify the webhook endpoint.
  */
@@ -47,7 +59,11 @@ export async function POST(request: NextRequest) {
           // Validate that messages array exists and is non-empty before processing
           if (Array.isArray(messages) && messages.length > 0) {
             for (const message of messages) {
-              const senderWaId = message?.from || value?.contacts?.[0]?.wa_id || null;
+              const rawSenderId = message?.from || value?.contacts?.[0]?.wa_id || null;
+              if (!rawSenderId) continue;
+
+              // Format sender WhatsApp ID cleanly as digits with country code (e.g. 21626342535)
+              const recipientPhone = formatWhatsAppId(rawSenderId);
 
               let messageBody: string | null = null;
               if (message?.type === 'text' && message?.text?.body) {
@@ -57,7 +73,7 @@ export async function POST(request: NextRequest) {
               }
 
               const recordToInsert = {
-                sender_wa_id: senderWaId,
+                sender_wa_id: recipientPhone,
                 message_body: messageBody,
                 raw_payload: body,
               };
@@ -88,9 +104,9 @@ export async function POST(request: NextRequest) {
               }
 
               // 2. Handle Text Messages: Order Extraction & Risk-Based Messaging
-              if (message?.type === 'text' && messageBody && senderWaId) {
+              if (message?.type === 'text' && messageBody) {
                 try {
-                  console.log(`[Order Extraction] Processing message for sender ${senderWaId}...`);
+                  console.log(`[Order Extraction] Processing message for sender ${recipientPhone}...`);
                   const extractionResult = await extractOrderFromMessage(messageBody);
                   const extracted = extractionResult.data;
 
@@ -100,56 +116,57 @@ export async function POST(request: NextRequest) {
                     error: extractionResult.error || null,
                   });
 
-                  // Prepare order payload matching Supabase orders schema
+                  // Prepare order payload matching standard Supabase orders schema
                   const orderToInsert = {
-                    seller_wa_id: senderWaId,
+                    seller_wa_id: recipientPhone,
                     buyer_name: extracted.buyer_name,
-                    buyer_phone: extracted.buyer_phone,
+                    buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : null,
                     address: extracted.address,
                     product: extracted.product,
                     price: extracted.price,
                     status: 'PENDING_CONFIRMATION',
-                    extracted_data: {
-                      address_is_complete: extracted.address_is_complete,
-                      risk_tier: extracted.risk_tier,
-                    },
                   };
 
+                  let insertedOrderId = `temp_${Date.now()}`;
                   console.log(`[Supabase Insert Attempt] Target Table: 'orders'`);
-                  const { data: orderData, error: orderError } = await supabase
-                    .from('orders')
-                    .insert(orderToInsert)
-                    .select();
 
-                  if (orderError) {
-                    console.error('[Supabase orders Insert Error]:', {
-                      message: orderError.message,
-                      details: orderError.details,
-                      hint: orderError.hint,
-                      code: orderError.code,
-                    });
-                  } else {
-                    console.log('[Supabase orders Insert Success] Inserted order row:', orderData);
+                  try {
+                    const { data: orderData, error: orderError } = await supabase
+                      .from('orders')
+                      .insert(orderToInsert)
+                      .select();
+
+                    if (orderError) {
+                      console.error('[Supabase orders Insert Error]:', {
+                        message: orderError.message,
+                        details: orderError.details,
+                        hint: orderError.hint,
+                        code: orderError.code,
+                      });
+                    } else {
+                      console.log('[Supabase orders Insert Success] Inserted order row:', orderData);
+                      if (orderData?.[0]?.id) {
+                        insertedOrderId = String(orderData[0].id);
+                      }
+                    }
+                  } catch (ordersDbErr) {
+                    console.error('[Supabase orders Insert Exception]:', ordersDbErr);
                   }
 
-                  // Determine target phone number to send interactive confirmation
-                  const targetPhone = extracted.buyer_phone || senderWaId;
-                  const insertedOrderId = orderData?.[0]?.id || `temp_${Date.now()}`;
-
-                  // Risk-based response routing
+                  // ALWAYS route outbound WhatsApp Cloud API messages to recipientPhone (sender's WA ID)
                   if (extracted.risk_tier === 'LOW') {
-                    console.log(`[Risk Routing] LOW Risk order. Sending interactive confirmation buttons to ${targetPhone}...`);
+                    console.log(`[Risk Routing] LOW Risk order. Sending interactive confirmation buttons to ${recipientPhone}...`);
                     const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'N/A'}\n\nPlease confirm your order details below:`;
 
-                    await sendInteractiveButtons(targetPhone, buttonText, [
+                    await sendInteractiveButtons(recipientPhone, buttonText, [
                       { id: `CONFIRM_${insertedOrderId}`, title: '✅ Confirm Order' },
                       { id: `OPTIONS_${insertedOrderId}`, title: '⚙️ Order Options' },
                     ]);
                   } else {
-                    console.log(`[Risk Routing] ${extracted.risk_tier} Risk order. Requesting location pin / full address from ${targetPhone}...`);
+                    console.log(`[Risk Routing] ${extracted.risk_tier} Risk order. Requesting location pin / full address from ${recipientPhone}...`);
                     const requestText = `📍 To complete your order confirmation, please share your current WhatsApp Location Pin or reply with your full delivery address (City & Street).`;
 
-                    await sendTextMessage(targetPhone, requestText);
+                    await sendTextMessage(recipientPhone, requestText);
                   }
                 } catch (orderProcessErr) {
                   console.error('[Order Processing Exception]:', orderProcessErr);
@@ -157,11 +174,11 @@ export async function POST(request: NextRequest) {
               }
 
               // 3. Handle Interactive Button Payloads (Meta Interactive Button Responses)
-              if (message?.type === 'interactive' && senderWaId) {
+              if (message?.type === 'interactive') {
                 try {
                   const buttonReply = message.interactive?.button_reply;
                   const buttonId = buttonReply?.id;
-                  console.log(`[Interactive Button Response] ID: '${buttonId}', Title: '${buttonReply?.title}' from ${senderWaId}`);
+                  console.log(`[Interactive Button Response] ID: '${buttonId}', Title: '${buttonReply?.title}' from ${recipientPhone}`);
 
                   if (buttonId) {
                     const firstUnderscore = buttonId.indexOf('_');
@@ -173,22 +190,26 @@ export async function POST(request: NextRequest) {
                       const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
 
                       // Update order in Supabase
-                      const { error: updateErr } = await supabase
-                        .from('orders')
-                        .update({
-                          status: 'CONFIRMED',
-                          confirmation_window_expires_at: expiresAt,
-                          confirmed_at: new Date().toISOString(),
-                        })
-                        .eq('id', orderId);
+                      try {
+                        const { error: updateErr } = await supabase
+                          .from('orders')
+                          .update({
+                            status: 'CONFIRMED',
+                            confirmation_window_expires_at: expiresAt,
+                            confirmed_at: new Date().toISOString(),
+                          })
+                          .eq('id', orderId);
 
-                      if (updateErr) {
-                        console.error('[Supabase Update Error - CONFIRM]:', updateErr);
+                        if (updateErr) {
+                          console.error('[Supabase Update Error - CONFIRM]:', updateErr);
+                        }
+                      } catch (dbUpdateErr) {
+                        console.error('[Supabase Update Exception - CONFIRM]:', dbUpdateErr);
                       }
 
-                      // Send response with options button
+                      // Send response with options button directly to recipientPhone
                       const confirmText = `✅ Order Confirmed! You have a 12-hour window to edit your order or update delivery details.`;
-                      await sendInteractiveButtons(senderWaId, confirmText, [
+                      await sendInteractiveButtons(recipientPhone, confirmText, [
                         { id: `OPTIONS_${orderId}`, title: '⚙️ Order Options' },
                       ]);
                     } else if (action === 'OPTIONS') {
@@ -197,25 +218,29 @@ export async function POST(request: NextRequest) {
                       // Check 12-hour remorse window expiration
                       let isExpired = false;
                       if (orderId && !orderId.startsWith('temp_')) {
-                        const { data: orderRow } = await supabase
-                          .from('orders')
-                          .select('confirmation_window_expires_at')
-                          .eq('id', orderId)
-                          .single();
+                        try {
+                          const { data: orderRow } = await supabase
+                            .from('orders')
+                            .select('confirmation_window_expires_at')
+                            .eq('id', orderId)
+                            .single();
 
-                        if (orderRow?.confirmation_window_expires_at) {
-                          isExpired = new Date() > new Date(orderRow.confirmation_window_expires_at);
+                          if (orderRow?.confirmation_window_expires_at) {
+                            isExpired = new Date() > new Date(orderRow.confirmation_window_expires_at);
+                          }
+                        } catch (fetchErr) {
+                          console.error('[Supabase Select Error - OPTIONS]:', fetchErr);
                         }
                       }
 
                       if (isExpired) {
                         await sendTextMessage(
-                          senderWaId,
+                          recipientPhone,
                           `⚠️ Your 12-hour edit window has expired. Your order is currently being prepared for dispatch!`
                         );
                       } else {
                         const optionsText = `⚙️ Order Management Options:\nSelect an option below to manage your order:`;
-                        await sendInteractiveButtons(senderWaId, optionsText, [
+                        await sendInteractiveButtons(recipientPhone, optionsText, [
                           { id: `EDIT_SIZE_${orderId}`, title: '✏️ Change Size' },
                           { id: `RESCHEDULE_${orderId}`, title: '📅 Delay Delivery' },
                           { id: `CANCEL_${orderId}`, title: '❌ Cancel Order' },
@@ -224,28 +249,32 @@ export async function POST(request: NextRequest) {
                     } else if (action === 'CANCEL') {
                       console.log(`[Action: CANCEL] Cancelling order ${orderId}...`);
 
-                      const { error: cancelErr } = await supabase
-                        .from('orders')
-                        .update({
-                          status: 'CANCELLED_PRE_DISPATCH',
-                          cancelled_at: new Date().toISOString(),
-                          cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
-                        })
-                        .eq('id', orderId);
+                      try {
+                        const { error: cancelErr } = await supabase
+                          .from('orders')
+                          .update({
+                            status: 'CANCELLED_PRE_DISPATCH',
+                            cancelled_at: new Date().toISOString(),
+                            cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
+                          })
+                          .eq('id', orderId);
 
-                      if (cancelErr) {
-                        console.error('[Supabase Update Error - CANCEL]:', cancelErr);
+                        if (cancelErr) {
+                          console.error('[Supabase Update Error - CANCEL]:', cancelErr);
+                        }
+                      } catch (dbCancelErr) {
+                        console.error('[Supabase Update Exception - CANCEL]:', dbCancelErr);
                       }
 
                       await sendTextMessage(
-                        senderWaId,
+                        recipientPhone,
                         `❌ Your order has been cancelled. Thank you for letting us know!`
                       );
                     } else if (action === 'EDIT' || action === 'RESCHEDULE' || buttonId.startsWith('EDIT_SIZE_')) {
                       console.log(`[Action: ${action}] Processing change request for order ${orderId}...`);
 
                       await sendTextMessage(
-                        senderWaId,
+                        recipientPhone,
                         `📝 Request received! Our support team will contact you shortly to update your order details.`
                       );
                     }
