@@ -116,14 +116,14 @@ export async function POST(request: NextRequest) {
                     error: extractionResult.error || null,
                   });
 
-                  // Prepare order payload matching standard Supabase orders schema
+                  // Prepare order payload matching standard Supabase orders schema, defaulting null product & price to 'N/A'
                   const orderToInsert = {
                     seller_wa_id: recipientPhone,
-                    buyer_name: extracted.buyer_name,
+                    buyer_name: extracted.buyer_name || null,
                     buyer_phone: extracted.buyer_phone ? formatWhatsAppId(extracted.buyer_phone) : null,
-                    address: extracted.address,
-                    product: extracted.product,
-                    price: extracted.price,
+                    address: extracted.address || null,
+                    product: extracted.product || 'N/A',
+                    price: extracted.price || 'N/A',
                     status: 'PENDING_CONFIRMATION',
                   };
 
@@ -156,7 +156,11 @@ export async function POST(request: NextRequest) {
                   // ALWAYS route outbound WhatsApp Cloud API messages to recipientPhone (sender's WA ID)
                   if (extracted.risk_tier === 'LOW') {
                     console.log(`[Risk Routing] LOW Risk order. Sending interactive confirmation buttons to ${recipientPhone}...`);
-                    const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'N/A'}\n\nPlease confirm your order details below:`;
+                    const productDisplay = extracted.product || 'N/A';
+                    const priceDisplay = extracted.price || 'N/A';
+                    const addressDisplay = extracted.address || 'N/A';
+
+                    const buttonText = `✅ Order Received!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${addressDisplay}\n\nPlease confirm your order details below:`;
 
                     await sendInteractiveButtons(recipientPhone, buttonText, [
                       { id: `CONFIRM_${insertedOrderId}`, title: '✅ Confirm Order' },
@@ -177,52 +181,71 @@ export async function POST(request: NextRequest) {
               if (message?.type === 'interactive') {
                 try {
                   const buttonReply = message.interactive?.button_reply;
-                  const buttonId = buttonReply?.id;
+                  const buttonId = buttonReply?.id || '';
                   console.log(`[Interactive Button Response] ID: '${buttonId}', Title: '${buttonReply?.title}' from ${recipientPhone}`);
 
                   if (buttonId) {
-                    const firstUnderscore = buttonId.indexOf('_');
-                    const action = firstUnderscore !== -1 ? buttonId.substring(0, firstUnderscore) : buttonId;
-                    const orderId = firstUnderscore !== -1 ? buttonId.substring(firstUnderscore + 1) : '';
+                    let action = '';
+                    let targetOrderId = '';
+
+                    if (buttonId.startsWith('CONFIRM_')) {
+                      action = 'CONFIRM';
+                      targetOrderId = buttonId.replace('CONFIRM_', '');
+                    } else if (buttonId.startsWith('OPTIONS_')) {
+                      action = 'OPTIONS';
+                      targetOrderId = buttonId.replace('OPTIONS_', '');
+                    } else if (buttonId.startsWith('CANCEL_')) {
+                      action = 'CANCEL';
+                      targetOrderId = buttonId.replace('CANCEL_', '');
+                    } else if (buttonId.startsWith('EDIT_SIZE_')) {
+                      action = 'EDIT_SIZE';
+                      targetOrderId = buttonId.replace('EDIT_SIZE_', '');
+                    } else if (buttonId.startsWith('RESCHEDULE_')) {
+                      action = 'RESCHEDULE';
+                      targetOrderId = buttonId.replace('RESCHEDULE_', '');
+                    }
 
                     if (action === 'CONFIRM') {
-                      console.log(`[Action: CONFIRM] Confirming order ${orderId}...`);
+                      console.log('[Button Action] Attempting status update for order ID:', targetOrderId);
                       const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
 
-                      // Update order in Supabase
+                      // Update order in Supabase to CONFIRMED
                       try {
-                        const { error: updateErr } = await supabase
+                        const { data: updateData, error: updateErr } = await supabase
                           .from('orders')
                           .update({
                             status: 'CONFIRMED',
-                            confirmation_window_expires_at: expiresAt,
                             confirmed_at: new Date().toISOString(),
+                            confirmation_window_expires_at: expiresAt,
                           })
-                          .eq('id', orderId);
+                          .eq('id', targetOrderId)
+                          .select();
 
                         if (updateErr) {
-                          console.error('[Supabase Update Error - CONFIRM]:', updateErr);
+                          console.error('[Button DB Update Error]', updateErr);
+                        } else {
+                          console.log('[Button DB Update Success] Order updated to CONFIRMED:', updateData);
                         }
                       } catch (dbUpdateErr) {
-                        console.error('[Supabase Update Exception - CONFIRM]:', dbUpdateErr);
+                        console.error('[Button DB Update Exception - CONFIRM]:', dbUpdateErr);
                       }
 
                       // Send response with options button directly to recipientPhone
                       const confirmText = `✅ Order Confirmed! You have a 12-hour window to edit your order or update delivery details.`;
                       await sendInteractiveButtons(recipientPhone, confirmText, [
-                        { id: `OPTIONS_${orderId}`, title: '⚙️ Order Options' },
+                        { id: `OPTIONS_${targetOrderId}`, title: '⚙️ Order Options' },
                       ]);
                     } else if (action === 'OPTIONS') {
-                      console.log(`[Action: OPTIONS] Displaying management menu for order ${orderId}...`);
+                      console.log(`[Action: OPTIONS] Displaying management menu for order ${targetOrderId}...`);
 
                       // Check 12-hour remorse window expiration
                       let isExpired = false;
-                      if (orderId && !orderId.startsWith('temp_')) {
+                      if (targetOrderId && !targetOrderId.startsWith('temp_')) {
                         try {
                           const { data: orderRow } = await supabase
                             .from('orders')
                             .select('confirmation_window_expires_at')
-                            .eq('id', orderId)
+                            .eq('id', targetOrderId)
                             .single();
 
                           if (orderRow?.confirmation_window_expires_at) {
@@ -241,37 +264,40 @@ export async function POST(request: NextRequest) {
                       } else {
                         const optionsText = `⚙️ Order Management Options:\nSelect an option below to manage your order:`;
                         await sendInteractiveButtons(recipientPhone, optionsText, [
-                          { id: `EDIT_SIZE_${orderId}`, title: '✏️ Change Size' },
-                          { id: `RESCHEDULE_${orderId}`, title: '📅 Delay Delivery' },
-                          { id: `CANCEL_${orderId}`, title: '❌ Cancel Order' },
+                          { id: `EDIT_SIZE_${targetOrderId}`, title: '✏️ Change Size' },
+                          { id: `RESCHEDULE_${targetOrderId}`, title: '📅 Delay Delivery' },
+                          { id: `CANCEL_${targetOrderId}`, title: '❌ Cancel Order' },
                         ]);
                       }
                     } else if (action === 'CANCEL') {
-                      console.log(`[Action: CANCEL] Cancelling order ${orderId}...`);
+                      console.log('[Button Action] Attempting status cancellation for order ID:', targetOrderId);
 
                       try {
-                        const { error: cancelErr } = await supabase
+                        const { data: cancelData, error: cancelErr } = await supabase
                           .from('orders')
                           .update({
                             status: 'CANCELLED_PRE_DISPATCH',
                             cancelled_at: new Date().toISOString(),
                             cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
                           })
-                          .eq('id', orderId);
+                          .eq('id', targetOrderId)
+                          .select();
 
                         if (cancelErr) {
-                          console.error('[Supabase Update Error - CANCEL]:', cancelErr);
+                          console.error('[Button DB Update Error - CANCEL]', cancelErr);
+                        } else {
+                          console.log('[Button DB Update Success] Order updated to CANCELLED_PRE_DISPATCH:', cancelData);
                         }
                       } catch (dbCancelErr) {
-                        console.error('[Supabase Update Exception - CANCEL]:', dbCancelErr);
+                        console.error('[Button DB Update Exception - CANCEL]:', dbCancelErr);
                       }
 
                       await sendTextMessage(
                         recipientPhone,
                         `❌ Your order has been cancelled. Thank you for letting us know!`
                       );
-                    } else if (action === 'EDIT' || action === 'RESCHEDULE' || buttonId.startsWith('EDIT_SIZE_')) {
-                      console.log(`[Action: ${action}] Processing change request for order ${orderId}...`);
+                    } else if (action === 'EDIT_SIZE' || action === 'RESCHEDULE') {
+                      console.log(`[Button Action: ${action}] Processing change request for order ${targetOrderId}...`);
 
                       await sendTextMessage(
                         recipientPhone,
