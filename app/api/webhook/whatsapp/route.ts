@@ -182,7 +182,7 @@ export async function POST(request: NextRequest) {
                 }
               }
 
-              // 3. Handle Interactive Button Payloads (Meta Interactive Button Responses)
+              // 3. Handle Interactive Button Payloads with Strict Protocol Guardrails & State Locking
               if (message?.type === 'interactive') {
                 try {
                   const buttonReply = message.interactive?.button_reply;
@@ -210,62 +210,89 @@ export async function POST(request: NextRequest) {
                       targetOrderId = buttonId.replace('RESCHEDULE_', '');
                     }
 
-                    if (action === 'CONFIRM') {
-                      console.log('[Button Action] Attempting status update for order ID:', targetOrderId);
-                      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+                    if (!targetOrderId) continue;
 
-                      // Update order in Supabase to CONFIRMED
+                    // GUARDRAIL STEP 1: Fetch Order First
+                    let order: any = null;
+                    if (!targetOrderId.startsWith('temp_')) {
                       try {
-                        const { data: updateData, error: updateErr } = await supabase
+                        const { data: fetchedOrder, error: fetchErr } = await supabase
                           .from('orders')
-                          .update({
-                            status: 'CONFIRMED',
-                            confirmed_at: new Date().toISOString(),
-                            confirmation_window_expires_at: expiresAt,
-                            updated_at: new Date().toISOString(),
-                          })
+                          .select('*')
                           .eq('id', targetOrderId)
-                          .select();
+                          .single();
 
-                        if (updateErr) {
-                          console.error('[Button DB Update Error]', updateErr);
-                        } else {
-                          console.log('[Button DB Update Success] Order updated to CONFIRMED:', updateData);
+                        if (fetchErr || !fetchedOrder) {
+                          console.warn('[Guardrail Warning] Order record not found for ID:', targetOrderId, fetchErr);
+                          await sendTextMessage(recipientPhone, '⚠️ Order record not found.');
+                          continue;
                         }
-                      } catch (dbUpdateErr) {
-                        console.error('[Button DB Update Exception - CONFIRM]:', dbUpdateErr);
+                        order = fetchedOrder;
+                      } catch (fetchException) {
+                        console.error('[Guardrail Exception] Error fetching order:', fetchException);
+                        await sendTextMessage(recipientPhone, '⚠️ Order record not found.');
+                        continue;
                       }
+                    }
 
-                      // Send response with options button directly to recipientPhone
-                      const confirmText = `✅ Order Confirmed! You have a 12-hour window to edit your order or update delivery details.`;
-                      await sendInteractiveButtons(recipientPhone, confirmText, [
-                        { id: `OPTIONS_${targetOrderId}`, title: '⚙️ Order Options' },
-                      ]);
-                    } else if (action === 'OPTIONS') {
-                      console.log(`[Action: OPTIONS] Displaying management menu for order ${targetOrderId}...`);
+                    // Extract current status & expiration from database row
+                    const currentStatus = order?.status || 'PENDING_CONFIRMATION';
+                    const expiresAtTimestamp = order?.confirmation_window_expires_at ? new Date(order.confirmation_window_expires_at) : null;
+                    const isWindowExpired = expiresAtTimestamp ? new Date() > expiresAtTimestamp : false;
 
-                      // Check 12-hour remorse window expiration
-                      let isExpired = false;
-                      if (targetOrderId && !targetOrderId.startsWith('temp_')) {
+                    // GUARDRAIL STEP 2: Execute State Machine Guardrail Rules
+                    if (action === 'CONFIRM') {
+                      console.log('[Guardrail Action: CONFIRM] Checking status for order ID:', targetOrderId, 'Current Status:', currentStatus);
+
+                      if (currentStatus === 'CONFIRMED') {
+                        console.log('[Guardrail] Order already confirmed:', targetOrderId);
+                        await sendInteractiveButtons(
+                          recipientPhone,
+                          'ℹ️ This order is already confirmed! You can manage your options below:',
+                          [{ id: `OPTIONS_${targetOrderId}`, title: '⚙️ Order Options' }]
+                        );
+                      } else if (currentStatus === 'CANCELLED_PRE_DISPATCH' || currentStatus === 'CANCELLED') {
+                        console.log('[Guardrail] Order is cancelled:', targetOrderId);
+                        await sendTextMessage(recipientPhone, '⚠️ This order was cancelled and cannot be confirmed.');
+                      } else {
+                        // Valid transition: PENDING_CONFIRMATION -> CONFIRMED
+                        const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+
                         try {
-                          const { data: orderRow } = await supabase
+                          const { data: updateData, error: updateErr } = await supabase
                             .from('orders')
-                            .select('confirmation_window_expires_at')
+                            .update({
+                              status: 'CONFIRMED',
+                              confirmed_at: new Date().toISOString(),
+                              confirmation_window_expires_at: expiresAt,
+                              updated_at: new Date().toISOString(),
+                            })
                             .eq('id', targetOrderId)
-                            .single();
+                            .select();
 
-                          if (orderRow?.confirmation_window_expires_at) {
-                            isExpired = new Date() > new Date(orderRow.confirmation_window_expires_at);
+                          if (updateErr) {
+                            console.error('[Button DB Update Error]', updateErr);
+                          } else {
+                            console.log('[Button DB Update Success] Order updated to CONFIRMED:', updateData);
                           }
-                        } catch (fetchErr) {
-                          console.error('[Supabase Select Error - OPTIONS]:', fetchErr);
+                        } catch (dbUpdateErr) {
+                          console.error('[Button DB Update Exception - CONFIRM]:', dbUpdateErr);
                         }
-                      }
 
-                      if (isExpired) {
+                        const confirmText = `✅ Order Confirmed! You have a 12-hour window to edit your order or update delivery details.`;
+                        await sendInteractiveButtons(recipientPhone, confirmText, [
+                          { id: `OPTIONS_${targetOrderId}`, title: '⚙️ Order Options' },
+                        ]);
+                      }
+                    } else if (action === 'OPTIONS') {
+                      console.log('[Guardrail Action: OPTIONS] Displaying management menu for order ID:', targetOrderId);
+
+                      if (currentStatus === 'CANCELLED_PRE_DISPATCH' || currentStatus === 'CANCELLED') {
+                        await sendTextMessage(recipientPhone, '❌ This order has been cancelled.');
+                      } else if (isWindowExpired) {
                         await sendTextMessage(
                           recipientPhone,
-                          `⚠️ Your 12-hour edit window has expired. Your order is currently being prepared for dispatch!`
+                          '⚠️ Your 12-hour edit window has expired. Your order is currently being prepared for dispatch!'
                         );
                       } else {
                         const optionsText = `⚙️ Order Management Options:\nSelect an option below to manage your order:`;
@@ -276,40 +303,56 @@ export async function POST(request: NextRequest) {
                         ]);
                       }
                     } else if (action === 'CANCEL') {
-                      console.log('[Button Action] Attempting status cancellation for order ID:', targetOrderId);
+                      console.log('[Guardrail Action: CANCEL] Attempting cancellation for order ID:', targetOrderId);
 
-                      try {
-                        const { data: cancelData, error: cancelErr } = await supabase
-                          .from('orders')
-                          .update({
-                            status: 'CANCELLED_PRE_DISPATCH',
-                            cancelled_at: new Date().toISOString(),
-                            cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
-                            updated_at: new Date().toISOString(),
-                          })
-                          .eq('id', targetOrderId)
-                          .select();
+                      if (currentStatus === 'CANCELLED_PRE_DISPATCH' || currentStatus === 'CANCELLED') {
+                        await sendTextMessage(recipientPhone, 'ℹ️ Order is already cancelled.');
+                      } else if (isWindowExpired) {
+                        await sendTextMessage(
+                          recipientPhone,
+                          '⚠️ Cancellation window has expired. Your order is currently in dispatch!'
+                        );
+                      } else {
+                        try {
+                          const { data: cancelData, error: cancelErr } = await supabase
+                            .from('orders')
+                            .update({
+                              status: 'CANCELLED_PRE_DISPATCH',
+                              cancelled_at: new Date().toISOString(),
+                              cancellation_reason: 'Buyer cancelled via WhatsApp interactive button',
+                              updated_at: new Date().toISOString(),
+                            })
+                            .eq('id', targetOrderId)
+                            .select();
 
-                        if (cancelErr) {
-                          console.error('[Button DB Update Error - CANCEL]', cancelErr);
-                        } else {
-                          console.log('[Button DB Update Success] Order updated to CANCELLED_PRE_DISPATCH:', cancelData);
+                          if (cancelErr) {
+                            console.error('[Button DB Update Error - CANCEL]', cancelErr);
+                          } else {
+                            console.log('[Button DB Update Success] Order updated to CANCELLED_PRE_DISPATCH:', cancelData);
+                          }
+                        } catch (dbCancelErr) {
+                          console.error('[Button DB Update Exception - CANCEL]:', dbCancelErr);
                         }
-                      } catch (dbCancelErr) {
-                        console.error('[Button DB Update Exception - CANCEL]:', dbCancelErr);
+
+                        await sendTextMessage(
+                          recipientPhone,
+                          '❌ Your order has been cancelled. Thank you for letting us know!'
+                        );
                       }
-
-                      await sendTextMessage(
-                        recipientPhone,
-                        `❌ Your order has been cancelled. Thank you for letting us know!`
-                      );
                     } else if (action === 'EDIT_SIZE' || action === 'RESCHEDULE') {
-                      console.log(`[Button Action: ${action}] Processing change request for order ${targetOrderId}...`);
+                      console.log(`[Guardrail Action: ${action}] Processing change request for order ID:`, targetOrderId);
 
-                      await sendTextMessage(
-                        recipientPhone,
-                        `📝 Request received! Our support team will contact you shortly to update your order details.`
-                      );
+                      if (isWindowExpired) {
+                        await sendTextMessage(
+                          recipientPhone,
+                          '⚠️ Your 12-hour edit window has expired. Your order is currently being prepared for dispatch!'
+                        );
+                      } else {
+                        await sendTextMessage(
+                          recipientPhone,
+                          '📝 Request received! Our support team will contact you shortly to update your order details.'
+                        );
+                      }
                     }
                   }
                 } catch (interactiveErr) {
