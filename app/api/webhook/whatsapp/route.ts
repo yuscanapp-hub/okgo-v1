@@ -20,6 +20,34 @@ function formatWhatsAppId(rawPhone: string | null | undefined): string | null {
 }
 
 /**
+ * Checks whether Meta's 24-hour customer service window is currently open for a given buyer.
+ * Queries webhook_events to verify if the buyer sent any message within the last 24 hours.
+ */
+async function hasOpen24HourWindow(buyerWaId: string | null | undefined): Promise<boolean> {
+  if (!buyerWaId) return false;
+
+  const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  try {
+    const { data } = await supabase
+      .from('webhook_events')
+      .select('created_at')
+      .eq('sender_wa_id', buyerWaId)
+      .gte('created_at', twentyFourHoursAgo)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const isWindowOpen = Boolean(data);
+    console.log(`[24h Window Check] Buyer ${buyerWaId}: open=${isWindowOpen} (last message: ${data?.created_at || 'none in last 24h'})`);
+    return isWindowOpen;
+  } catch (err) {
+    console.error('[24h Window Check Exception]:', err);
+    return false;
+  }
+}
+
+/**
  * Validates Meta X-Hub-Signature-256 header using WHATSAPP_APP_SECRET.
  */
 function verifyMetaSignature(rawBody: string, signatureHeader: string | null): boolean {
@@ -172,14 +200,9 @@ export async function POST(request: NextRequest) {
                 const validatedBuyerPhone = formatWhatsAppId(possiblePhone);
 
                 if (validatedBuyerPhone) {
-                  // Check if buyer has prior orders
-                  const { count: recoveryPriorCount } = await supabase
-                    .from('orders')
-                    .select('id', { count: 'exact', head: true })
-                    .eq('buyer_wa_id', validatedBuyerPhone);
-
-                  const isFirstTimeBuyerRecovery = !recoveryPriorCount || recoveryPriorCount <= 0;
-                  const initialStatus = isFirstTimeBuyerRecovery ? 'AWAITING_FIRST_REPLY' : 'PENDING_CONFIRMATION';
+                  // UNIFIED 24H WINDOW EVALUATION
+                  const isWindowOpen = await hasOpen24HourWindow(validatedBuyerPhone);
+                  const initialStatus = isWindowOpen ? 'PENDING_CONFIRMATION' : 'AWAITING_FIRST_REPLY';
 
                   const { error: recoveryErr } = await supabase
                     .from('orders')
@@ -196,7 +219,7 @@ export async function POST(request: NextRequest) {
                   } else {
                     console.log(`[Awaiting Phone Recovery Success] Order ${awaitingPhoneOrder.id} updated with buyer phone ${validatedBuyerPhone} (Status: ${initialStatus})`);
 
-                    if (isFirstTimeBuyerRecovery) {
+                    if (!isWindowOpen) {
                       // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) with 3 required params
                       const orderShortId = String(awaitingPhoneOrder.id).slice(0, 8);
                       const todayDateStr = new Date().toISOString().split('T')[0];
@@ -301,7 +324,7 @@ export async function POST(request: NextRequest) {
                   ]);
                 }
 
-                // BUYER SUBMITS TEXT MESSAGE
+                // BUYER SUBMITS TEXT MESSAGE OR REPLY
                 else if (message?.type === 'text' && messageBody) {
                   const extractionResult = await extractOrderFromMessage(messageBody);
                   const extracted = extractionResult.data;
@@ -335,8 +358,7 @@ export async function POST(request: NextRequest) {
                       { id: `OPTIONS_${activeBuyerOrder.id}`, title: '⚙️ Order Options' },
                     ]);
                   } else {
-                    // GAP 3 & ITEM 3: BUYER FREE-TEXT (e.g. "change color to blue")
-                    // Forward text directly to Seller (seller_wa_id) without modifying address
+                    // BUYER FREE-TEXT (e.g. "change color to blue") -> Forward to Seller
                     const sellerPhone = formatWhatsAppId(activeBuyerOrder.seller_wa_id);
                     const orderShortId = String(activeBuyerOrder.id).slice(0, 8);
 
@@ -479,14 +501,9 @@ export async function POST(request: NextRequest) {
                       .limit(1)
                       .maybeSingle();
 
-                    // Check if buyer has any prior orders
-                    const { count: priorOrderCount } = await supabase
-                      .from('orders')
-                      .select('id', { count: 'exact', head: true })
-                      .eq('buyer_wa_id', formattedBuyerPhone);
-
-                    const isFirstTimeBuyer = !priorOrderCount || priorOrderCount <= 0;
-                    const initialStatus = isFirstTimeBuyer ? 'AWAITING_FIRST_REPLY' : 'PENDING_CONFIRMATION';
+                    // UNIFIED 24H WINDOW EVALUATION (Queries webhook_events for buyer message in last 24h)
+                    const isWindowOpen = await hasOpen24HourWindow(formattedBuyerPhone);
+                    const initialStatus = isWindowOpen ? 'PENDING_CONFIRMATION' : 'AWAITING_FIRST_REPLY';
 
                     // STEP 1: CREATE FRESH ORDER FIRST
                     const orderToInsert = {
@@ -534,9 +551,9 @@ export async function POST(request: NextRequest) {
                     const todayDateStr = new Date().toISOString().split('T')[0];
                     const buyerName = extracted.buyer_name || 'Customer';
 
-                    if (isFirstTimeBuyer) {
-                      // Send ONLY template message for first-time buyers with 3 required parameters
-                      console.log(`[First-Time Buyer Outreach] Opening 24h window for ${formattedBuyerPhone} via template jaspers_market_order_confirmation_v1 (Status: AWAITING_FIRST_REPLY)`);
+                    if (!isWindowOpen) {
+                      // 24h Window is CLOSED -> Send ONLY template message for outreach
+                      console.log(`[24h Window Closed] Sending template jaspers_market_order_confirmation_v1 to ${formattedBuyerPhone} (Status: AWAITING_FIRST_REPLY)`);
                       await sendTemplateMessage(
                         formattedBuyerPhone,
                         'jaspers_market_order_confirmation_v1',
@@ -550,7 +567,7 @@ export async function POST(request: NextRequest) {
                         `📦 Order created for ${buyerName} (${formattedBuyerPhone}). Template confirmation sent! Awaiting buyer's reply to enable interactive options.`
                       );
                     } else {
-                      // Send interactive buttons directly for existing contacts (24h window already open)
+                      // 24h Window IS OPEN -> Send interactive buttons / text directly
                       if (extracted.risk_tier === 'LOW') {
                         const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'Pending'}\n\nPlease confirm your order details below:`;
                         await sendInteractiveButtons(formattedBuyerPhone, buttonText, [
@@ -584,4 +601,3 @@ export async function POST(request: NextRequest) {
 
   return NextResponse.json({ status: 'ok' }, { status: 200 });
 }
-
