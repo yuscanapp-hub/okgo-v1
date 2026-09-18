@@ -172,13 +172,21 @@ export async function POST(request: NextRequest) {
                 const validatedBuyerPhone = formatWhatsAppId(possiblePhone);
 
                 if (validatedBuyerPhone) {
-                  // Update order to PENDING_CONFIRMATION
+                  // Check if buyer has prior orders
+                  const { count: recoveryPriorCount } = await supabase
+                    .from('orders')
+                    .select('id', { count: 'exact', head: true })
+                    .eq('buyer_wa_id', validatedBuyerPhone);
+
+                  const isFirstTimeBuyerRecovery = !recoveryPriorCount || recoveryPriorCount <= 0;
+                  const initialStatus = isFirstTimeBuyerRecovery ? 'AWAITING_FIRST_REPLY' : 'PENDING_CONFIRMATION';
+
                   const { error: recoveryErr } = await supabase
                     .from('orders')
                     .update({
                       buyer_wa_id: validatedBuyerPhone,
                       buyer_phone: validatedBuyerPhone,
-                      status: 'PENDING_CONFIRMATION',
+                      status: initialStatus,
                       updated_at: new Date().toISOString(),
                     })
                     .eq('id', awaitingPhoneOrder.id);
@@ -186,49 +194,48 @@ export async function POST(request: NextRequest) {
                   if (recoveryErr) {
                     console.error('[Awaiting Phone Recovery Update Error]:', recoveryErr);
                   } else {
-                    console.log(`[Awaiting Phone Recovery Success] Order ${awaitingPhoneOrder.id} updated with buyer phone ${validatedBuyerPhone}`);
-
-                    // Check if buyer has any prior orders (first-time contact)
-                    const { count: recoveryPriorCount } = await supabase
-                      .from('orders')
-                      .select('id', { count: 'exact', head: true })
-                      .eq('buyer_wa_id', validatedBuyerPhone);
-
-                    const isFirstTimeBuyerRecovery = !recoveryPriorCount || recoveryPriorCount <= 1;
+                    console.log(`[Awaiting Phone Recovery Success] Order ${awaitingPhoneOrder.id} updated with buyer phone ${validatedBuyerPhone} (Status: ${initialStatus})`);
 
                     if (isFirstTimeBuyerRecovery) {
-                      // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) to open Meta 24-hour window for first-time buyers. Will be replaced by branded OKGO template once approved.
-                      console.log(`[First-Time Buyer Recovery Outreach] Opening 24h window for ${validatedBuyerPhone} via template jaspers_market_order_confirmation_v1`);
+                      // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) with 3 required params
+                      const orderShortId = String(awaitingPhoneOrder.id).slice(0, 8);
+                      const todayDateStr = new Date().toISOString().split('T')[0];
+                      const buyerName = awaitingPhoneOrder.buyer_name || 'Customer';
+
                       await sendTemplateMessage(
                         validatedBuyerPhone,
                         'jaspers_market_order_confirmation_v1',
                         'en_US',
-                        [awaitingPhoneOrder.buyer_name || 'Customer']
+                        [buyerName, orderShortId, todayDateStr]
                       );
-                    }
 
-                    // Send confirmation message to BUYER
-                    const productDisplay = awaitingPhoneOrder.product || 'N/A';
-                    const priceDisplay = awaitingPhoneOrder.price || 'N/A';
-
-                    if (awaitingPhoneOrder.risk_tier === 'LOW') {
-                      const buttonText = `✅ Order Received!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${awaitingPhoneOrder.address || 'Pending'}\n\nPlease confirm your order details below:`;
-                      await sendInteractiveButtons(validatedBuyerPhone, buttonText, [
-                        { id: `CONFIRM_${awaitingPhoneOrder.id}`, title: '✅ Confirm Order' },
-                        { id: `OPTIONS_${awaitingPhoneOrder.id}`, title: '⚙️ Order Options' },
-                      ]);
-                    } else {
                       await sendTextMessage(
-                        validatedBuyerPhone,
-                        '📍 To complete your order confirmation, please share your WhatsApp Location Pin or reply with your full delivery address (City & Street).'
+                        senderWaId,
+                        `✅ Buyer phone updated to ${validatedBuyerPhone}. Template confirmation sent to buyer! Awaiting buyer's reply to enable interactive options.`
+                      );
+                    } else {
+                      const productDisplay = awaitingPhoneOrder.product || 'N/A';
+                      const priceDisplay = awaitingPhoneOrder.price || 'N/A';
+
+                      if (awaitingPhoneOrder.risk_tier === 'LOW') {
+                        const buttonText = `✅ Order Received!\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${awaitingPhoneOrder.address || 'Pending'}\n\nPlease confirm your order details below:`;
+                        await sendInteractiveButtons(validatedBuyerPhone, buttonText, [
+                          { id: `CONFIRM_${awaitingPhoneOrder.id}`, title: '✅ Confirm Order' },
+                          { id: `OPTIONS_${awaitingPhoneOrder.id}`, title: '⚙️ Order Options' },
+                        ]);
+                      } else {
+                        await sendTextMessage(
+                          validatedBuyerPhone,
+                          '📍 To complete your order confirmation, please share your WhatsApp Location Pin or reply with your full delivery address (City & Street).'
+                        );
+                      }
+
+                      // Send receipt to SELLER
+                      await sendTextMessage(
+                        senderWaId,
+                        `✅ Buyer phone number updated to ${validatedBuyerPhone}. Confirmation message sent to buyer!`
                       );
                     }
-
-                    // Send receipt to SELLER
-                    await sendTextMessage(
-                      senderWaId,
-                      `✅ Buyer phone number updated to ${validatedBuyerPhone}. Confirmation message sent to buyer!`
-                    );
                     continue; // Handled recovery!
                   }
                 } else {
@@ -241,13 +248,13 @@ export async function POST(request: NextRequest) {
               }
 
               // ═════════════════════════════════════════════════════════════════════
-              // GAP 3: ROUTING CHECK INCLUDING 'NEEDS_SELLER_REVIEW'
+              // ROUTING CHECK INCLUDING 'AWAITING_FIRST_REPLY'
               // ═════════════════════════════════════════════════════════════════════
               const { data: activeBuyerOrder } = await supabase
                 .from('orders')
                 .select('*')
                 .eq('buyer_wa_id', senderWaId)
-                .in('status', ['PENDING_CONFIRMATION', 'CONFIRMED', 'NEEDS_SELLER_REVIEW'])
+                .in('status', ['AWAITING_FIRST_REPLY', 'PENDING_CONFIRMATION', 'CONFIRMED', 'NEEDS_SELLER_REVIEW'])
                 .order('created_at', { ascending: false })
                 .limit(1)
                 .maybeSingle();
@@ -257,6 +264,20 @@ export async function POST(request: NextRequest) {
               // ═════════════════════════════════════════════════════════════════════
               if (activeBuyerOrder) {
                 console.log(`[Buyer Handler] Processing message from Buyer ${senderWaId} for Order ${activeBuyerOrder.id} (Status: ${activeBuyerOrder.status})`);
+
+                // LIFECYCLE UNLOCK: If buyer was in AWAITING_FIRST_REPLY, this reply HAS OPENED the 24h window!
+                const isFirstReply = activeBuyerOrder.status === 'AWAITING_FIRST_REPLY';
+                if (isFirstReply) {
+                  console.log(`[First Reply Unlocked] Buyer ${senderWaId} replied! 24h window is now open. Moving order ${activeBuyerOrder.id} to PENDING_CONFIRMATION.`);
+                  await supabase
+                    .from('orders')
+                    .update({
+                      status: 'PENDING_CONFIRMATION',
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq('id', activeBuyerOrder.id);
+                  activeBuyerOrder.status = 'PENDING_CONFIRMATION';
+                }
 
                 // BUYER SUBMITS GPS LOCATION PIN
                 if (message?.type === 'location' && message?.location) {
@@ -299,6 +320,17 @@ export async function POST(request: NextRequest) {
 
                     const addrButtonText = `📍 Address updated!\n\n📦 Product: ${activeBuyerOrder.product}\n💰 Price: ${activeBuyerOrder.price}\n📍 Address: ${extracted.address}\n\nPlease confirm your order below:`;
                     await sendInteractiveButtons(senderWaId, addrButtonText, [
+                      { id: `CONFIRM_${activeBuyerOrder.id}`, title: '✅ Confirm Order' },
+                      { id: `OPTIONS_${activeBuyerOrder.id}`, title: '⚙️ Order Options' },
+                    ]);
+                  } else if (isFirstReply) {
+                    // First-time buyer generic text reply -> Send interactive buttons now that 24h window is open!
+                    const productDisplay = activeBuyerOrder.product || 'N/A';
+                    const priceDisplay = activeBuyerOrder.price || 'N/A';
+                    const addressDisplay = activeBuyerOrder.address || 'Pending';
+
+                    const buttonText = `✅ Order Details:\n\n📦 Product: ${productDisplay}\n💰 Price: ${priceDisplay}\n📍 Address: ${addressDisplay}\n\nPlease confirm your order details below:`;
+                    await sendInteractiveButtons(senderWaId, buttonText, [
                       { id: `CONFIRM_${activeBuyerOrder.id}`, title: '✅ Confirm Order' },
                       { id: `OPTIONS_${activeBuyerOrder.id}`, title: '⚙️ Order Options' },
                     ]);
@@ -388,7 +420,10 @@ export async function POST(request: NextRequest) {
                     const sellerPhone = formatWhatsAppId(activeBuyerOrder.seller_wa_id);
                     if (sellerPhone) {
                       const orderShortId = String(targetOrderId).slice(0, 8);
-                      await sendTextMessage(sellerPhone, `⚠️ Buyer requested an order update on Order #${orderShortId}. Please contact the buyer.`);
+                      await sendTextMessage(
+                        sellerPhone,
+                        `⚠️ Buyer requested an order update on Order #${orderShortId}. Please contact the buyer.`
+                      );
                     }
                   }
                 }
@@ -434,18 +469,26 @@ export async function POST(request: NextRequest) {
                     );
                   } else {
                     // GAP 2 & ITEM 6: SELLER ORDER SUPERSEDENCE (FAIL-SAFE ATOMIC SEQUENCE)
-                    // Check if an existing pending order exists for this same buyer & seller
                     const { data: existingPending } = await supabase
                       .from('orders')
                       .select('id')
                       .eq('seller_wa_id', sellerWaId)
                       .eq('buyer_wa_id', formattedBuyerPhone)
-                      .eq('status', 'PENDING_CONFIRMATION')
+                      .in('status', ['AWAITING_FIRST_REPLY', 'PENDING_CONFIRMATION'])
                       .order('created_at', { ascending: false })
                       .limit(1)
                       .maybeSingle();
 
-                    // STEP 1: CREATE FRESH ORDER FIRST (Ensures old order is never cancelled if new insert fails)
+                    // Check if buyer has any prior orders
+                    const { count: priorOrderCount } = await supabase
+                      .from('orders')
+                      .select('id', { count: 'exact', head: true })
+                      .eq('buyer_wa_id', formattedBuyerPhone);
+
+                    const isFirstTimeBuyer = !priorOrderCount || priorOrderCount <= 0;
+                    const initialStatus = isFirstTimeBuyer ? 'AWAITING_FIRST_REPLY' : 'PENDING_CONFIRMATION';
+
+                    // STEP 1: CREATE FRESH ORDER FIRST
                     const orderToInsert = {
                       seller_wa_id: sellerWaId,
                       buyer_wa_id: formattedBuyerPhone,
@@ -454,7 +497,7 @@ export async function POST(request: NextRequest) {
                       address: extracted.address || 'Pending',
                       product: extracted.product || 'N/A',
                       price: extracted.price || 'N/A',
-                      status: 'PENDING_CONFIRMATION',
+                      status: initialStatus,
                       extracted_data: extracted,
                       address_is_complete: Boolean(extracted.address_is_complete),
                       risk_tier: extracted.risk_tier || 'LOW',
@@ -468,14 +511,14 @@ export async function POST(request: NextRequest) {
 
                     if (insertErr) {
                       console.error('[Supabase Order Insert Error]:', insertErr);
-                      await sendTextMessage(sellerWaId, '⚠️ Error saving new order. Your existing pending order remains active.');
+                      await sendTextMessage(sellerWaId, '⚠️ Error saving new order. Your existing order remains active.');
                       continue;
                     }
 
-                    // STEP 2: ONLY AFTER INSERT SUCCEEDS, MARK OLD ORDER AS SUPERSEDED
+                    // STEP 2: MARK OLD ORDER AS SUPERSEDED
                     if (existingPending) {
                       console.log(`[Seller Supersedence] Successfully created new order ${insertedOrder?.[0]?.id}. Superseding old order ${existingPending.id}`);
-                      const { error: supersedErr } = await supabase
+                      await supabase
                         .from('orders')
                         .update({
                           status: 'CANCELLED_PRE_DISPATCH',
@@ -484,52 +527,49 @@ export async function POST(request: NextRequest) {
                           updated_at: new Date().toISOString(),
                         })
                         .eq('id', existingPending.id);
-
-                      if (supersedErr) {
-                        console.error('[Seller Supersedence Update Error]:', supersedErr);
-                      }
                     }
 
                     const newOrderId = insertedOrder?.[0]?.id || `temp_${Date.now()}`;
-
-                    // Check if buyer has any prior orders (first-time contact)
-                    const { count: priorOrderCount } = await supabase
-                      .from('orders')
-                      .select('id', { count: 'exact', head: true })
-                      .eq('buyer_wa_id', formattedBuyerPhone);
-
-                    const isFirstTimeBuyer = !priorOrderCount || priorOrderCount <= 1;
+                    const orderShortId = String(newOrderId).slice(0, 8);
+                    const todayDateStr = new Date().toISOString().split('T')[0];
+                    const buyerName = extracted.buyer_name || 'Customer';
 
                     if (isFirstTimeBuyer) {
-                      // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) to open Meta 24-hour window for first-time buyers. Will be replaced by branded OKGO template once approved.
-                      console.log(`[First-Time Buyer Outreach] Opening 24h window for ${formattedBuyerPhone} via template jaspers_market_order_confirmation_v1`);
+                      // Send ONLY template message for first-time buyers with 3 required parameters
+                      console.log(`[First-Time Buyer Outreach] Opening 24h window for ${formattedBuyerPhone} via template jaspers_market_order_confirmation_v1 (Status: AWAITING_FIRST_REPLY)`);
                       await sendTemplateMessage(
                         formattedBuyerPhone,
                         'jaspers_market_order_confirmation_v1',
                         'en_US',
-                        [extracted.buyer_name || 'Customer']
+                        [buyerName, orderShortId, todayDateStr]
                       );
-                    }
 
-                    // Send confirmation message to BUYER (formattedBuyerPhone)
-                    if (extracted.risk_tier === 'LOW') {
-                      const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'Pending'}\n\nPlease confirm your order details below:`;
-                      await sendInteractiveButtons(formattedBuyerPhone, buttonText, [
-                        { id: `CONFIRM_${newOrderId}`, title: '✅ Confirm Order' },
-                        { id: `OPTIONS_${newOrderId}`, title: '⚙️ Order Options' },
-                      ]);
-                    } else {
+                      // Notify SELLER
                       await sendTextMessage(
-                        formattedBuyerPhone,
-                        '📍 To complete your order confirmation, please share your WhatsApp Location Pin or reply with your full delivery address (City & Street).'
+                        sellerWaId,
+                        `📦 Order created for ${buyerName} (${formattedBuyerPhone}). Template confirmation sent! Awaiting buyer's reply to enable interactive options.`
+                      );
+                    } else {
+                      // Send interactive buttons directly for existing contacts (24h window already open)
+                      if (extracted.risk_tier === 'LOW') {
+                        const buttonText = `✅ Order Received!\n\n📦 Product: ${extracted.product || 'N/A'}\n💰 Price: ${extracted.price || 'N/A'}\n📍 Address: ${extracted.address || 'Pending'}\n\nPlease confirm your order details below:`;
+                        await sendInteractiveButtons(formattedBuyerPhone, buttonText, [
+                          { id: `CONFIRM_${newOrderId}`, title: '✅ Confirm Order' },
+                          { id: `OPTIONS_${newOrderId}`, title: '⚙️ Order Options' },
+                        ]);
+                      } else {
+                        await sendTextMessage(
+                          formattedBuyerPhone,
+                          '📍 To complete your order confirmation, please share your WhatsApp Location Pin or reply with your full delivery address (City & Street).'
+                        );
+                      }
+
+                      // Notify SELLER
+                      await sendTextMessage(
+                        sellerWaId,
+                        `📦 Order created for ${buyerName} (${formattedBuyerPhone}). Confirmation message sent to buyer!`
                       );
                     }
-
-                    // Notify SELLER (sellerWaId) that confirmation was dispatched to buyer
-                    await sendTextMessage(
-                      sellerWaId,
-                      `📦 Order created for ${extracted.buyer_name || 'Buyer'} (${formattedBuyerPhone}). Confirmation message sent to buyer!`
-                    );
                   }
                 }
               }
