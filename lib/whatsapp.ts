@@ -175,3 +175,84 @@ export async function sendInteractiveButtons(
     return { success: false, error: errorMessage };
   }
 }
+
+/**
+ * Sends a pre-approved Meta WhatsApp Message Template.
+ * Used for business-initiated outreach to open or work outside the 24-hour customer window.
+ */
+export async function sendTemplateMessage(
+  to: string,
+  templateName: string,
+  languageCode: string = 'en_US',
+  bodyParameters: string[] = []
+): Promise<WhatsAppSendResult> {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+  if (!phoneNumberId) {
+    console.error(
+      '[WhatsApp API Error] Missing WHATSAPP_PHONE_NUMBER_ID in environment'
+    );
+    return { success: false, error: 'WHATSAPP_PHONE_NUMBER_ID is not configured' };
+  }
+
+  let token: string;
+  try {
+    token = resolveToken();
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    return { success: false, error: errorMessage };
+  }
+
+  const url = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
+
+  const templatePayload: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: {
+        code: languageCode,
+      },
+    },
+  };
+
+  if (bodyParameters.length > 0) {
+    (templatePayload.template as Record<string, unknown>).components = [
+      {
+        type: 'body',
+        parameters: bodyParameters.map((param) => ({
+          type: 'text',
+          text: param,
+        })),
+      },
+    ];
+  }
+
+  try {
+    console.log(`[WhatsApp API] Sending template message "${templateName}" (${languageCode}) to ${to}`);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(templatePayload),
+    });
+
+    const responseData = await response.json();
+
+    if (!response.ok) {
+      console.error(`[WhatsApp API Error] HTTP ${response.status}:`, responseData);
+      return { success: false, data: responseData, error: `HTTP ${response.status}` };
+    }
+
+    console.log('[WhatsApp API Success] Template message sent:', responseData);
+    return { success: true, data: responseData };
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error('[WhatsApp API Exception]:', errorMessage);
+    return { success: false, error: errorMessage };
+  }
+}

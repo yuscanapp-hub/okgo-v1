@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { supabase } from '@/lib/supabase';
 import { extractOrderFromMessage } from '@/lib/groq';
-import { sendInteractiveButtons, sendTextMessage } from '@/lib/whatsapp';
+import { sendInteractiveButtons, sendTemplateMessage, sendTextMessage } from '@/lib/whatsapp';
 import { WhatsAppWebhookPayload } from '@/types/whatsapp';
 
 /**
@@ -187,6 +187,25 @@ export async function POST(request: NextRequest) {
                     console.error('[Awaiting Phone Recovery Update Error]:', recoveryErr);
                   } else {
                     console.log(`[Awaiting Phone Recovery Success] Order ${awaitingPhoneOrder.id} updated with buyer phone ${validatedBuyerPhone}`);
+
+                    // Check if buyer has any prior orders (first-time contact)
+                    const { count: recoveryPriorCount } = await supabase
+                      .from('orders')
+                      .select('id', { count: 'exact', head: true })
+                      .eq('buyer_wa_id', validatedBuyerPhone);
+
+                    const isFirstTimeBuyerRecovery = !recoveryPriorCount || recoveryPriorCount <= 1;
+
+                    if (isFirstTimeBuyerRecovery) {
+                      // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) to open Meta 24-hour window for first-time buyers. Will be replaced by branded OKGO template once approved.
+                      console.log(`[First-Time Buyer Recovery Outreach] Opening 24h window for ${validatedBuyerPhone} via template jaspers_market_order_confirmation_v1`);
+                      await sendTemplateMessage(
+                        validatedBuyerPhone,
+                        'jaspers_market_order_confirmation_v1',
+                        'en_US',
+                        [awaitingPhoneOrder.buyer_name || 'Customer']
+                      );
+                    }
 
                     // Send confirmation message to BUYER
                     const productDisplay = awaitingPhoneOrder.product || 'N/A';
@@ -472,6 +491,25 @@ export async function POST(request: NextRequest) {
                     }
 
                     const newOrderId = insertedOrder?.[0]?.id || `temp_${Date.now()}`;
+
+                    // Check if buyer has any prior orders (first-time contact)
+                    const { count: priorOrderCount } = await supabase
+                      .from('orders')
+                      .select('id', { count: 'exact', head: true })
+                      .eq('buyer_wa_id', formattedBuyerPhone);
+
+                    const isFirstTimeBuyer = !priorOrderCount || priorOrderCount <= 1;
+
+                    if (isFirstTimeBuyer) {
+                      // TEMPORARY placeholder template (jaspers_market_order_confirmation_v1) to open Meta 24-hour window for first-time buyers. Will be replaced by branded OKGO template once approved.
+                      console.log(`[First-Time Buyer Outreach] Opening 24h window for ${formattedBuyerPhone} via template jaspers_market_order_confirmation_v1`);
+                      await sendTemplateMessage(
+                        formattedBuyerPhone,
+                        'jaspers_market_order_confirmation_v1',
+                        'en_US',
+                        [extracted.buyer_name || 'Customer']
+                      );
+                    }
 
                     // Send confirmation message to BUYER (formattedBuyerPhone)
                     if (extracted.risk_tier === 'LOW') {
